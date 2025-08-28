@@ -23,21 +23,19 @@ const int P2P_POWER_DBM = 14; // set to legal value for your deployment
 
 // ---- App params ----
 uint16_t NODE_ID = 0x1234;
-#define TX_PERIOD_SEC 1 // wake every N seconds (change as needed)
-RTC_DATA_ATTR uint16_t pktCount = 0;
+#define TX_PERIOD_SEC 1 // transmit every N seconds
+uint16_t pktCount = 0;
+unsigned long lastTxMillis = 0;
 
 // ---------- Sensor model (future-proof) ----------
 struct SensorData {
-  // Units are explicit to avoid confusion; keep POD for easy pass-by-value
-  int16_t temp_centi;  // e.g., 2534 -> 25.34 °C
-  int16_t hum_centi;   // e.g., 6012 -> 60.12 %
-  uint32_t updated_ms; // millis() when updated
+  
 };
-static SensorData g_sensor;
+// define a global sensor struct to hold latest readings
 
 // Frame layout (11 bytes)
 // 0:A5  1-2:node  3-4:count  5-6:temp_centi  7-8:hum_centi  9-10:CRC16
-static const size_t FRAME_LEN = 11;
+// define frame length
 
 // CRC16-IBM (Modbus), poly 0xA001
 uint16_t crc16_ibm(const uint8_t *data, size_t len) {
@@ -81,7 +79,7 @@ bool readLine(String &out, unsigned long timeout = 1500) {
 
 bool sendAT(HardwareSerial &port, const String &cmd,
             unsigned long timeout = 2000) {
-  port.printf("%s\r\n", cmd.c_str());
+  //uart print to port
   Serial.printf("Sent: %s\n", cmd.c_str()); // DEBUG
   String line;
   while (readLine(line, timeout)) {
@@ -116,8 +114,7 @@ bool rakSetupP2P(HardwareSerial &port, bool asSender) {
   drainPort(port, 300);
 
   char buf[128];
-  snprintf(buf, sizeof(buf), "at+set_config=lorap2p:%s:%d:%d:%d:%d:%d",
-           P2P_FREQ_HZ, P2P_SF, P2P_BW, P2P_CR, P2P_PREAMBLE, P2P_POWER_DBM);
+  //construct command string
   if (!sendAT(port, buf, 3000))
     return false;
 
@@ -127,34 +124,6 @@ bool rakSetupP2P(HardwareSerial &port, bool asSender) {
   if (!sendAT(port, role))
     return false;
 
-  return true;
-}
-
-// ===== App =====
-unsigned long nextTxMs = 0;
-
-// Wake the RAK_A from sleep via RX rising edges, then ensure "Wake Up" state
-bool wakeRAK(HardwareSerial &port) {
-  // Burst of 'U' characters (0x55) -> many RX edges (per RAK_A manual: RX
-  // rising-edge wakes)
-  for (int i = 0; i < 24; i++) {
-    port.write('U');
-    delay(2);
-  }
-  delay(30);
-
-  // Try explicit wake command (works if parser is alive)
-  sendAT(port, "AT", 300);
-  if (!sendAT(port, "at+set_config=device:sleep:0", 800)) {
-    // Try once more after extra pulses
-    for (int i = 0; i < 24; i++) {
-      port.write('U');
-      delay(2);
-    }
-    delay(30);
-    if (!sendAT(port, "at+set_config=device:sleep:0", 1000))
-      return false;
-  }
   return true;
 }
 
@@ -175,103 +144,41 @@ bool updateSensors(SensorData &out) {
 // obtained.
 static size_t buildFrame(uint8_t *f, const SensorData &s, uint16_t node,
                          uint16_t count) {
-  size_t i = 0;
-  f[i++] = 0xA5;
-  f[i++] = node >> 8;
-  f[i++] = node & 0xFF;
-  f[i++] = count >> 8;
-  f[i++] = count & 0xFF;
-  f[i++] = s.temp_centi >> 8;
-  f[i++] = s.temp_centi & 0xFF;
-  f[i++] = s.hum_centi >> 8;
-  f[i++] = s.hum_centi & 0xFF;
-  const uint16_t crc = crc16_ibm(f, i);
-  f[i++] = crc >> 8;
-  f[i++] = crc & 0xFF;
-  return i;
+  //build frame code
 }
 
-// ---------- One-shot TX then sleep ----------
-void doOnce_TX_and_sleep(HardwareSerial &port) {
-  // 1) Update the global sensor struct (only this function changes when you add
-  // real sensors)
-  if (!updateSensors(g_sensor)) {
-    // Decide how you want to handle sensor errors; here we still send last/zero
-    // data.
-    Serial.println("WARN: sensor update failed");
-  }
+// ---------- Transmit data ----------
+void transmitData(HardwareSerial &port) {
+  // 1) Update the global sensor struct
 
   // 2) Build payload from the struct
-  uint8_t frame[FRAME_LEN];
-  const size_t n = buildFrame(frame, g_sensor, NODE_ID, pktCount);
-  const String hex = toHex(frame, n);
-  const bool sent = sendAT(port, "at+send=lorap2p:" + hex, 4000);
-  Serial.printf("TX #%u %s\n", pktCount, sent ? "OK" : "FAIL");
-  pktCount++;
-
-  // Put RAK_A to sleep to save power
-  if (sendAT(port, "at+set_config=device:sleep:1", 800)) {
-    Serial.println("port -> Sleep");
-  } else {
-    Serial.println("WARN: port sleep cmd no OK");
-  }
-
-  // ESP32 deep sleep timer
-  esp_sleep_enable_timer_wakeup((uint64_t)TX_PERIOD_SEC * 1000000ULL);
-  Serial.printf("ESP32 deep sleeping for %u s...\n", TX_PERIOD_SEC);
-  esp_deep_sleep_start(); // never returns
-}
-
-void print_wakeup_reason() {
-  esp_sleep_wakeup_cause_t wakeup_reason;
-
-  wakeup_reason = esp_sleep_get_wakeup_cause();
-
-  switch (wakeup_reason) {
-  case ESP_SLEEP_WAKEUP_EXT0:
-    Serial.println("Wakeup caused by external signal using RTC_IO");
-    break;
-  case ESP_SLEEP_WAKEUP_EXT1:
-    Serial.println("Wakeup caused by external signal using RTC_CNTL");
-    break;
-  case ESP_SLEEP_WAKEUP_TIMER:
-    Serial.println("Wakeup caused by timer");
-    break;
-  case ESP_SLEEP_WAKEUP_TOUCHPAD:
-    Serial.println("Wakeup caused by touchpad");
-    break;
-  case ESP_SLEEP_WAKEUP_ULP:
-    Serial.println("Wakeup caused by ULP program");
-    break;
-  default:
-    Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason);
-    break;
-  }
+  
+  // 3) Send via AT command
 }
 
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("ESP32 + Dual RAK4270 (A=TX, B=RX)");
+  Serial.println("ESP32 + RAK4270 (P2P Sender Demo)");
 
-  // Bring up both UARTs with custom pins
-  RAK.begin(RAK_BAUD, SERIAL_8N1, RAK_A_RX, RAK_A_TX); // Sender UART2
+  // Initialize UART for RAK module
+  RAK.begin(RAK_BAUD, SERIAL_8N1, RAK_A_RX, RAK_A_TX);
   delay(200);
 
-  print_wakeup_reason();
-  // Wake RAK_A (if it was sleeping)
-  if (!wakeRAK(RAK)) {
-    Serial.println("ERR: RAK_A did not wake");
-    // Still proceed; next commands might wake implicitly.
-  }
-
-  // Ensure P2P TX config each boot (safe; module resets on deep sleep)
+  // Configure P2P mode
   if (!rakSetupP2P(RAK, /*asSender=*/true)) {
     Serial.println("ERR: P2P setup failed");
   }
 
-  // Transmit once, then sleep everything
-  doOnce_TX_and_sleep(RAK);
+  // Send first transmission
+  transmitData(RAK);
+  lastTxMillis = millis();
 }
 
-void loop() {}
+void loop() {
+  // Check if it's time for the next transmission
+  if (millis() - lastTxMillis >= TX_PERIOD_SEC * 1000) {
+    transmitData(RAK);
+    lastTxMillis = millis();
+  }
+}
