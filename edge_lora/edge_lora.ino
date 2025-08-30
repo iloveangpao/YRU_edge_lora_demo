@@ -1,4 +1,4 @@
-// ========= Edge Node: ESP32 + RAK4270 (P2P Sender) =========
+// ========= Edge Node: ESP32// No timer period needed - we wake up on RX activityRAK4270 (P2P Sender) =========
 #include <Arduino.h>
 
 // ---- UART wiring ----
@@ -23,8 +23,19 @@ const int P2P_POWER_DBM = 14; // set to legal value for your deployment
 
 // ---- App params ----
 uint16_t NODE_ID = 0x1234;
-#define TX_PERIOD_SEC 1 // wake every N seconds (change as needed)
-RTC_DATA_ATTR uint16_t pktCount = 0;
+uint16_t pktCount = 0;
+bool isRequestReceived = false;
+
+// ---- Frame types ----
+#define FRAME_TYPE_REQUEST 0xA1
+#define FRAME_TYPE_RESPONSE 0xA5
+
+// ---- States ----
+enum NodeState {
+  STATE_LISTENING,
+  STATE_SENDING
+};
+NodeState currentState = STATE_LISTENING;
 
 // ---------- Sensor model (future-proof) ----------
 struct SensorData {
@@ -35,9 +46,14 @@ struct SensorData {
 };
 static SensorData g_sensor;
 
-// Frame layout (11 bytes)
+// Frame layouts
+// Request frame (5 bytes):
+// 0:A1  1-2:target_node  3-4:CRC16
+static const size_t REQUEST_FRAME_LEN = 5;
+
+// Response frame (11 bytes):
 // 0:A5  1-2:node  3-4:count  5-6:temp_centi  7-8:hum_centi  9-10:CRC16
-static const size_t FRAME_LEN = 11;
+static const size_t RESPONSE_FRAME_LEN = 11;
 
 // CRC16-IBM (Modbus), poly 0xA001
 uint16_t crc16_ibm(const uint8_t *data, size_t len) {
@@ -108,26 +124,77 @@ String toHex(const uint8_t *data, size_t len) {
   return s;
 }
 
-// Configure a RAK4270 for P2P, then set TX or RX role
-bool rakSetupP2P(HardwareSerial &port, bool asSender) {
-  sendAT(port,
-         "at+set_config=lora:work_mode:1"); // switch to P2P (module restarts)
+// Configure RAK4270 for P2P mode
+bool rakSetupP2P(HardwareSerial &port) {
+  sendAT(port, "at+set_config=lora:work_mode:1"); // switch to P2P (module restarts)
   delay(600);
   drainPort(port, 300);
 
   char buf[128];
   snprintf(buf, sizeof(buf), "at+set_config=lorap2p:%s:%d:%d:%d:%d:%d",
            P2P_FREQ_HZ, P2P_SF, P2P_BW, P2P_CR, P2P_PREAMBLE, P2P_POWER_DBM);
-  if (!sendAT(port, buf, 3000))
-    return false;
+  return sendAT(port, buf, 3000);
+}
 
-  // 1=RX, 2=Sender(TX trigger mode)
-  String role =
-      String("at+set_config=lorap2p:transfer_mode:") + (asSender ? "2" : "1");
-  if (!sendAT(port, role))
-    return false;
+// Switch between RX and TX modes
+bool setRxMode(HardwareSerial &port) {
+  currentState = STATE_LISTENING;
+  return sendAT(port, "at+set_config=lorap2p:transfer_mode:1");  // 1 = RX mode
+}
 
-  return true;
+bool setTxMode(HardwareSerial &port) {
+  currentState = STATE_SENDING;
+  return sendAT(port, "at+set_config=lorap2p:transfer_mode:2");  // 2 = TX mode
+}
+
+// Parse received data for a request frame
+bool parseRequestFrame(const String &hexData) {
+  if (hexData.length() != REQUEST_FRAME_LEN * 2) return false;
+  
+  // Convert first byte to check frame type
+  char frametype[3] = {hexData[0], hexData[1], 0};
+  uint8_t type = strtoul(frametype, NULL, 16);
+  if (type != FRAME_TYPE_REQUEST) return false;
+  
+  // Extract target node ID
+  char nodeid[5] = {hexData[2], hexData[3], hexData[4], hexData[5], 0};
+  uint16_t targetNode = strtoul(nodeid, NULL, 16);
+  
+  // Check if request is for us
+  return targetNode == NODE_ID;
+}
+
+void print_wakeup_reason() {
+  esp_sleep_wakeup_cause_t wakeup_reason;
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  switch (wakeup_reason) {
+  case ESP_SLEEP_WAKEUP_EXT0:
+    Serial.println("Wakeup caused by external signal using RTC_IO");
+    break;
+  case ESP_SLEEP_WAKEUP_EXT1:
+    Serial.println("Wakeup caused by external signal using RTC_CNTL");
+    break;
+  case ESP_SLEEP_WAKEUP_TIMER:
+    Serial.println("Wakeup caused by timer");
+    break;
+  case ESP_SLEEP_WAKEUP_TOUCHPAD:
+    Serial.println("Wakeup caused by touchpad");
+    break;
+  case ESP_SLEEP_WAKEUP_ULP:
+    Serial.println("Wakeup caused by ULP program");
+    break;
+  default:
+    Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason);
+    break;
+  }
+}
+
+// Empty loop as we never reach it (deep sleep causes reset)
+void loop() {}
+
+void updateActivityTime() {
+  lastActivityTime = millis();
 }
 
 // ===== App =====
@@ -191,87 +258,106 @@ static size_t buildFrame(uint8_t *f, const SensorData &s, uint16_t node,
   return i;
 }
 
-// ---------- One-shot TX then sleep ----------
-void doOnce_TX_and_sleep(HardwareSerial &port) {
-  // 1) Update the global sensor struct (only this function changes when you add
-  // real sensors)
+// Send sensor data response
+bool sendResponse(HardwareSerial &port) {
+  // Update sensor data
   if (!updateSensors(g_sensor)) {
-    // Decide how you want to handle sensor errors; here we still send last/zero
-    // data.
     Serial.println("WARN: sensor update failed");
   }
 
-  // 2) Build payload from the struct
-  uint8_t frame[FRAME_LEN];
+  // Build and send response frame
+  uint8_t frame[RESPONSE_FRAME_LEN];
   const size_t n = buildFrame(frame, g_sensor, NODE_ID, pktCount);
   const String hex = toHex(frame, n);
+  
+  // Switch to TX mode and send
+  if (!setTxMode(port)) {
+    Serial.println("Failed to switch to TX mode");
+    return false;
+  }
+  
   const bool sent = sendAT(port, "at+send=lorap2p:" + hex, 4000);
-  Serial.printf("TX #%u %s\n", pktCount, sent ? "OK" : "FAIL");
+  Serial.printf("TX Response #%u %s\n", pktCount, sent ? "OK" : "FAIL");
   pktCount++;
 
-  // Put RAK_A to sleep to save power
-  if (sendAT(port, "at+set_config=device:sleep:1", 800)) {
-    Serial.println("port -> Sleep");
-  } else {
-    Serial.println("WARN: port sleep cmd no OK");
+  // Switch back to RX mode
+  if (!setRxMode(port)) {
+    Serial.println("Failed to switch back to RX mode");
+    return false;
   }
-
-  // ESP32 deep sleep timer
-  esp_sleep_enable_timer_wakeup((uint64_t)TX_PERIOD_SEC * 1000000ULL);
-  Serial.printf("ESP32 deep sleeping for %u s...\n", TX_PERIOD_SEC);
-  esp_deep_sleep_start(); // never returns
+  
+  return sent;
 }
 
-void print_wakeup_reason() {
-  esp_sleep_wakeup_cause_t wakeup_reason;
+// Process received data and handle response if needed
+bool handleReceivedData(const String &data) {
+    // Check if this is LoRa received data
+    if (!data.startsWith("+RCV=")) {
+        return false;
+    }
+    
+    // Extract the received data part
+    String hexData = data.substring(5);
+    
+    // Validate request and check if it's for us
+    if (!parseRequestFrame(hexData)) {
+        Serial.println("Invalid request or not for us, ignoring");
+        return false;
+    }
 
-  wakeup_reason = esp_sleep_get_wakeup_cause();
-
-  switch (wakeup_reason) {
-  case ESP_SLEEP_WAKEUP_EXT0:
-    Serial.println("Wakeup caused by external signal using RTC_IO");
-    break;
-  case ESP_SLEEP_WAKEUP_EXT1:
-    Serial.println("Wakeup caused by external signal using RTC_CNTL");
-    break;
-  case ESP_SLEEP_WAKEUP_TIMER:
-    Serial.println("Wakeup caused by timer");
-    break;
-  case ESP_SLEEP_WAKEUP_TOUCHPAD:
-    Serial.println("Wakeup caused by touchpad");
-    break;
-  case ESP_SLEEP_WAKEUP_ULP:
-    Serial.println("Wakeup caused by ULP program");
-    break;
-  default:
-    Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason);
-    break;
-  }
+    Serial.println("Valid request received, sending response");
+    return true;
 }
 
 void setup() {
-  Serial.begin(115200);
-  delay(300);
-  Serial.println("ESP32 + Dual RAK4270 (A=TX, B=RX)");
+    Serial.begin(115200);
+    delay(300);
+    Serial.println("ESP32 + RAK4270 (Edge Node - RX Wake & Response)");
 
-  // Bring up both UARTs with custom pins
-  RAK.begin(RAK_BAUD, SERIAL_8N1, RAK_A_RX, RAK_A_TX); // Sender UART2
-  delay(200);
+    // Print wake-up reason
+    print_wakeup_reason();
 
-  print_wakeup_reason();
-  // Wake RAK_A (if it was sleeping)
-  if (!wakeRAK(RAK)) {
-    Serial.println("ERR: RAK_A did not wake");
-    // Still proceed; next commands might wake implicitly.
-  }
+    // Initialize UART for RAK module
+    RAK.begin(RAK_BAUD, SERIAL_8N1, RAK_A_RX, RAK_A_TX);
+    delay(200);
 
-  // Ensure P2P TX config each boot (safe; module resets on deep sleep)
-  if (!rakSetupP2P(RAK, /*asSender=*/true)) {
-    Serial.println("ERR: P2P setup failed");
-  }
+    // If waking from RX pin trigger, wait for complete data reception
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+        Serial.println("Woken up by UART RX - checking incoming data...");
+        delay(100);  // Give RAK module time to finish receiving
+        
+        // Try to read and process the incoming data
+        String data;
+        if (readLine(data)) {
+            if (handleReceivedData(data)) {
+                // Valid request received, send response
+                if (!sendResponse(RAK)) {
+                    Serial.println("Failed to send response");
+                }
+            }
+        }
+    }
 
-  // Transmit once, then sleep everything
-  doOnce_TX_and_sleep(RAK);
+    // Configure P2P mode
+    if (!rakSetupP2P(RAK)) {
+        Serial.println("ERR: P2P setup failed");
+        return;
+    }
+
+    // Ensure we're in RX mode before sleep
+    if (!setRxMode(RAK)) {
+        Serial.println("ERR: Failed to set RX mode");
+        return;
+    }
+    
+    Serial.printf("Edge node %04X going to sleep, waiting for requests...\n", NODE_ID);
+
+    // Configure wake-up and go to sleep
+    gpio_num_t gpio_num = GPIO_NUM_26;  // RAK_A_RX is GPIO26
+    esp_sleep_enable_ext0_wakeup(gpio_num, 1);  // Wake up when pin goes HIGH
+    esp_deep_sleep_start();
+    // Note: Code never reaches beyond this point due to deep sleep
 }
 
+// Empty loop as we never reach it (deep sleep causes reset)
 void loop() {}
